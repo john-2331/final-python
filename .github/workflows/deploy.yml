@@ -1,0 +1,176 @@
+# CI/CD: build -> push to Docker Hub -> deploy to Amazon ECS (EC2)
+# Triggers on push to main. Secrets must be configured in the GitHub repo settings.
+# No Amazon ECR — image registry is Docker Hub only.
+
+name: Build, Push (Docker Hub), Deploy (ECS)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  # Image naming uses GitHub Secrets; tags include latest + short SHA
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ secrets.DOCKERHUB_REPOSITORY }}
+
+permissions:
+  id-token: write   # kept for optional OIDC; deploy uses access keys below
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build and Push to Docker Hub
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Image will be: ${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image was pushed
+        run: |
+          set -euo pipefail
+          echo "Verifying tags exist on Docker Hub for ${{ env.IMAGE_NAME }}"
+          # Token auth against Docker Hub Registry API v2
+          TOKEN=$(curl -sS -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_TOKEN }}" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${{ env.IMAGE_NAME }}:pull" \
+            | jq -r .token)
+          for TAG in latest "${{ steps.meta.outputs.tag }}"; do
+            HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "https://registry-1.docker.io/v2/${{ env.IMAGE_NAME }}/manifests/${TAG}")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "ERROR: Tag '${TAG}' not found on Docker Hub (HTTP ${HTTP_CODE})"
+              exit 1
+            fi
+            echo "OK: ${{ env.IMAGE_NAME }}:${TAG}"
+          done
+
+  deploy:
+    name: Deploy to Amazon ECS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Access keys are used because OIDC AssumeRoleWithWebIdentity was denied
+      # in this AWS account. AWS_ROLE_ARN remains configured for OIDC retries.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download current ECS task definition
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "${{ secrets.ECS_TASK_DEFINITION }}" \
+            --query 'taskDefinition' \
+            > task-definition.json
+          # Strip fields that register-task-definition rejects
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' task-definition.json > task-definition.clean.json
+          mv task-definition.clean.json task-definition.json
+
+      - name: Render Amazon ECS task definition with new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ secrets.CONTAINER_NAME }}
+          # Build URI here — job outputs that include secrets are stripped by Actions
+          image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ secrets.DOCKERHUB_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Deploy Amazon ECS task definition
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ secrets.ECS_SERVICE }}
+          cluster: ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify ECS service health
+        run: |
+          set -euo pipefail
+          CLUSTER="${{ secrets.ECS_CLUSTER }}"
+          SERVICE="${{ secrets.ECS_SERVICE }}"
+
+          echo "Describing service ${SERVICE} on cluster ${CLUSTER}..."
+          STATUS=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].status' \
+            --output text)
+          RUNNING=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].runningCount' \
+            --output text)
+          DESIRED=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].desiredCount' \
+            --output text)
+          PRIMARY=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`].rolloutState' \
+            --output text)
+
+          echo "status=${STATUS} running=${RUNNING} desired=${DESIRED} rollout=${PRIMARY}"
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "ERROR: Service status is ${STATUS}, expected ACTIVE"
+            exit 1
+          fi
+          if [ "$RUNNING" -lt 1 ] || [ "$RUNNING" -ne "$DESIRED" ]; then
+            echo "ERROR: runningCount (${RUNNING}) does not match desiredCount (${DESIRED})"
+            exit 1
+          fi
+          if [ -n "$PRIMARY" ] && [ "$PRIMARY" != "COMPLETED" ] && [ "$PRIMARY" != "None" ]; then
+            echo "WARNING: Primary rollout state is ${PRIMARY}"
+          fi
+
+          echo "Deployment verification succeeded for image ${{ secrets.DOCKERHUB_USERNAME }}/${{ secrets.DOCKERHUB_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}"

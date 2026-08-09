@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECSDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks",
+        "ecs:RegisterTaskDefinition",
+        "ecs:UpdateService"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+        "arn:aws:iam::ACCOUNT_ID:role/finalPythonTaskRole"
+      ]
+    }
+  ]
+}

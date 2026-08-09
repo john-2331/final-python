@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Docker
+*.log
+
+This.docx
+This (1).docx
+.venv-docs/
+.venv-docs/
